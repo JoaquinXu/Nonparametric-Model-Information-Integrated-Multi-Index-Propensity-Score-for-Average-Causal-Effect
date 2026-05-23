@@ -1,0 +1,1 @@
+# Nonparametric-Model-Information-Integrated-Multi-Index-Propensity-Score-for-Average-Causal-Effect
