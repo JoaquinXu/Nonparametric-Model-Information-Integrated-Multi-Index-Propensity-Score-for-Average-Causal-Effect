@@ -1,73 +1,165 @@
-# Nonparametric-Model-Information-Integrated-Multi-Index-Propensity-Score-for-Average-Causal-Effect
-npMiPS GitHub code archive
-==========================
+# npMiPS: educational R code for the revised workflow
 
-This archive provides a minimal, runnable R implementation of the proposed
-nonparametric model information-integrated multi-index propensity score (npMiPS)
-workflow described in the manuscript.
+This repository provides a compact, runnable example of the revised
+**nonparametric model information-integrated multi-index propensity score (npMiPS)**
+workflow.
 
-Files
------
-1. npMiPS_functions.R
-   Core functions for:
-   - generating simulated data under the manuscript data-generating mechanism;
-   - fitting parametric and ANN-based PS models;
-   - fitting parametric and ANN-based outcome regression (OcR) models;
-   - selecting ANN.PS, ANN.OcR, and integration-ANN hidden-layer structures in a
-     single observed dataset;
-   - constructing npMiPS from multiple PS/OcR model indexes;
-   - estimating ACE by IPW using npMiPS;
-   - bootstrap inference with ANN structures fixed after selection.
+The code is designed for **method learning and reproducibility of the workflow**.
+It is intentionally simpler than the simulation settings used in the manuscript:
 
-2. run_npMiPS_example_once.R
-   A minimal example script. It generates one simulated dataset, selects ANN
-   structures within that dataset, estimates npMiPS-111111, performs a small
-   number of bootstrap resamples, and saves example outputs in the results folder.
+- the example uses 6 baseline covariates instead of the larger manuscript setting;
+- variable types, coefficients, nonlinear terms, and treatment prevalence are different;
+- the example uses a small candidate architecture set and a small number of bootstrap samples so that it can run quickly;
+- the example data-generating mechanism is therefore **not intended to reproduce any manuscript table**.
 
-Required R packages
--------------------
-- AMORE
-- MASS
+The main goal is to show how the revised procedure is implemented.
 
-You can install them with:
-install.packages(c("AMORE", "MASS"))
+## Main revision reflected in this code
 
-How to run
-----------
-From the folder containing the R files, run:
+The integration ANN is selected by **3-fold out-of-fold mean absolute standardized mean difference (OOF-MASMD)** rather than by in-sample prediction accuracy for treatment (PAT).
 
-Rscript run_npMiPS_example_once.R
+For each candidate integration-ANN architecture:
 
-Relationship to the manuscript
-------------------------------
-The simulated data-generating mechanism follows the manuscript setting:
-- 12 baseline covariates are generated.
-- X1-X4 are associated with both treatment and outcome.
-- X5-X7 are associated only with treatment.
-- X8-X10 are associated only with outcome.
-- X11-X12 are independent noise covariates.
-- alpha0 = -0.75 gives approximately 25% treated subjects.
-- alpha0 = 0 gives approximately 50% treated subjects.
-- The true ACE is 1.
+1. split the data into treatment-stratified folds;
+2. fit all nuisance models using the training folds only;
+3. construct the model indexes in the training and held-out folds;
+4. fit the integration ANN in the training folds;
+5. predict propensity scores in the held-out fold;
+6. combine the held-out predictions across folds;
+7. calculate MASMD using ordinary ATE inverse-probability weights;
+8. select the architecture with the smallest OOF-MASMD.
 
-The argument model_set controls the parametric model set used in npMiPS:
-- model_set = "with_correct" corresponds to model sets A and B in the manuscript.
-  The two parametric PS/OcR models include one correctly specified model and one
-  misspecified model.
-- model_set = "without_correct" corresponds to model sets P and M in the manuscript.
-  The two parametric PS/OcR models are both misspecified.
+If a numerical tie occurs, the code prefers larger effective sample size (ESS), then the simpler ANN architecture.
 
-The six-digit npMiPS code follows the manuscript notation. For example,
-npMiPS-111111 includes ANN.PS, parametric PS Model 1, parametric PS Model 2,
-ANN.OcR, parametric OcR Model 1, and parametric OcR Model 2.
+The selected architecture is then refitted on the full observed dataset and held fixed during bootstrap resampling.
 
-Important note
---------------
-The example script is intended to demonstrate the complete npMiPS workflow on one
-simulated dataset. It is not intended to reproduce the full Monte Carlo simulation
-tables in the manuscript. To run manuscript-scale simulations, increase the number
-of Monte Carlo replicates and bootstrap resamples, and use:
+## Files
 
-candidate_structures <- default_hidden_candidates()
+### `npMiPS_functions.R`
+Core functions for:
 
-instead of the reduced candidate set used in the example script.
+- generating a small demonstration dataset;
+- fitting parametric and ANN-based PS models;
+- fitting parametric and ANN-based outcome regression models;
+- selecting ANN.PS by MASMD;
+- selecting ANN.OcR by mean observed prediction absolute error (MOPAE);
+- selecting the integration ANN by 3-fold OOF-MASMD;
+- calculating overlap, balance, calibration, ESS, and weight diagnostics;
+- estimating ACE by normalized IPW;
+- bootstrap inference with the selected ANN structures fixed.
+
+### `01_run_npMiPS_OOF_demo.R`
+A complete educational example of the revised npMiPS workflow.
+
+The example:
+
+1. simulates one dataset;
+2. selects ANN.PS and ANN.OcR structures;
+3. selects the integration ANN using OOF-MASMD;
+4. estimates the ACE;
+5. performs a small bootstrap;
+6. saves the selected structures and diagnostic results.
+
+### `02_run_crossfitted_SL_AIPW_demo.R`
+A compact example of the cross-fitted Super Learner AIPW comparator used in the revision.
+
+This script uses:
+
+- outer 3-fold cross-fitting;
+- Super Learner nuisance estimation for both PS and outcome regression;
+- AIPW estimation from out-of-fold nuisance predictions;
+- influence-function standard errors.
+
+The candidate learner library is deliberately small in this educational example.
+
+### `AMORE_0.2-15.tar.gz`
+A local source archive retained from the previous code package for convenience when AMORE is not available through the user's usual package repository.
+
+## Required R packages
+
+For the npMiPS demo:
+
+```r
+install.packages("MASS")
+# If AMORE is available from your configured repository:
+install.packages("AMORE")
+# Otherwise, from this repository folder:
+install.packages("AMORE_0.2-15.tar.gz", repos = NULL, type = "source")
+```
+
+For the Super Learner AIPW demo:
+
+```r
+install.packages(c("SuperLearner", "nnet"))
+```
+
+
+### Compatibility note for `SuperLearner`
+
+The Super Learner demo explicitly evaluates learner and screening functions in the
+`SuperLearner` namespace. This avoids an `object 'All' not found` error that can occur
+in some R/SuperLearner installations when the package is used through `::` without
+being attached to the search path.
+
+## How to run
+
+The two demonstration scripts automatically try to locate their own folder when run with
+RStudio, `source()`, or `Rscript`. Keep `npMiPS_functions.R` in the same folder as the two
+demo scripts.
+
+In RStudio, you can open either script and click **Source**, or run:
+
+```r
+source("/path/to/npMiPS_GitHub_code_v3_2/01_run_npMiPS_OOF_demo.R")
+source("/path/to/npMiPS_GitHub_code_v3_2/02_run_crossfitted_SL_AIPW_demo.R")
+```
+
+If your R/RStudio environment cannot detect the script path automatically, first set the
+working directory to the repository folder:
+
+```r
+setwd("/path/to/npMiPS_GitHub_code_v3_2")
+source("01_run_npMiPS_OOF_demo.R")
+source("02_run_crossfitted_SL_AIPW_demo.R")
+```
+
+Or from a terminal:
+
+```bash
+Rscript 01_run_npMiPS_OOF_demo.R
+Rscript 02_run_crossfitted_SL_AIPW_demo.R
+```
+
+Outputs are written to the `results/` folder.
+
+## Important implementation notes
+
+- The OOF folds are stratified by treatment and are fixed across candidate integration-ANN architectures.
+- ANN.PS and ANN.OcR structures are selected once in the observed dataset in this demonstration.
+- During integration-ANN tuning, nuisance models are re-estimated within each outer training fold to avoid leakage from held-out observations.
+- The propensity score is clipped only at `1e-7` and `1 - 1e-7` for numerical stability; this is not substantive truncation.
+- OOF-MASMD uses ordinary ATE-IPW weights.
+- Weight-stability diagnostics use stabilized weights.
+- The bootstrap keeps the selected ANN structures fixed and therefore does not propagate architecture-selection uncertainty.
+- The demonstration is **not a fully cross-fitted npMiPS estimator**. OOF is used for architecture tuning; the final npMiPS propensity score is refitted using the full observed dataset.
+
+## Full candidate integration-ANN set
+
+The demonstration uses only a few architectures for speed. The function
+`full_integration_candidates()` returns the larger candidate set used by the revised manuscript workflow.
+
+To use it, replace:
+
+```r
+integration_candidates <- demo_integration_candidates()
+```
+
+with:
+
+```r
+integration_candidates <- full_integration_candidates()
+```
+
+## Scope
+
+The scripts are intended to make the workflow transparent and easy to learn. They should not be interpreted as exact code for reproducing every numerical result in the manuscript, because the demonstration data-generating mechanism and computational settings are intentionally simplified.

@@ -1,591 +1,558 @@
 ################################################################################
-# npMiPS functions
+# npMiPS educational functions
 #
-# This file contains the core functions for the nonparametric model
-# information-integrated multi-index propensity score (npMiPS) estimator.
-# It is written as a self-contained function library for the GitHub code archive.
+# Purpose
+# -------
+# A compact implementation of the revised npMiPS workflow for teaching and
+# code transparency. The demonstration data-generating mechanism is intentionally
+# simpler and different from that used in the manuscript.
 #
-# Required packages: AMORE, MASS
+# Required package: AMORE
 ################################################################################
 
-require_package <- function(pkg) {
+require_pkg <- function(pkg) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
-    stop(sprintf("Package '%s' is required. Please install it before running this code.", pkg),
-         call. = FALSE)
+    stop(sprintf("Package '%s' is required but is not installed.", pkg), call. = FALSE)
   }
 }
 
-require_package("AMORE")
-require_package("MASS")
+require_pkg("AMORE")
 
 ################################################################################
-# Utility functions
+# 1. General utilities
 ################################################################################
 
 expit <- function(x) 1 / (1 + exp(-x))
 
-clip_probability <- function(p, eps = 1e-7) {
-  p <- as.numeric(p)
-  p[p < eps] <- eps
-  p[p > 1 - eps] <- 1 - eps
-  p
+clip_ps <- function(p, eps = 1e-7) {
+  pmin(pmax(as.numeric(p), eps), 1 - eps)
 }
 
-logit_safe <- function(p, eps = 1e-7) {
-  p <- clip_probability(p, eps = eps)
-  log(p / (1 - p))
+structure_label <- function(h) paste(as.integer(h), collapse = "-")
+
+structure_complexity <- function(h) {
+  # Fewer hidden layers first, then fewer total hidden nodes.
+  c(n_layers = length(h), total_nodes = sum(h))
 }
 
-weighted_sd <- function(x, w) {
-  m <- sum(w * x) / sum(w)
-  sqrt(sum(w * (x - m)^2) / sum(w))
+seed_hash <- function(...) {
+  vals <- unlist(list(...), use.names = FALSE)
+  vals <- vapply(vals, function(z) {
+    if (is.character(z)) sum(utf8ToInt(z)) else as.numeric(z)
+  }, numeric(1))
+  h <- 104729
+  for (z in vals) h <- (h * 1009 + z * 9176 + 12345) %% 2147483000
+  as.integer(h + 1)
 }
 
-absolute_mean_difference <- function(x, A, w) {
-  abs(sum(x * A * w) / sum(A * w) -
-        sum(x * (1 - A) * w) / sum((1 - A) * w))
+make_stratified_folds <- function(A, K = 3, seed = 1001) {
+  fold <- integer(length(A))
+  for (g in c(0, 1)) {
+    id <- which(A == g)
+    if (length(id) < K) stop("A treatment group has fewer observations than folds.")
+    set.seed(seed_hash(seed, g))
+    id <- sample(id, length(id), replace = FALSE)
+    fold[id] <- rep(seq_len(K), length.out = length(id))
+  }
+  fold
 }
 
-estimate_ipw <- function(Y, A, ps, eps = 1e-7) {
-  ps <- clip_probability(ps, eps = eps)
-  mu1 <- sum(Y * A / ps) / sum(A / ps)
-  mu0 <- sum(Y * (1 - A) / (1 - ps)) / sum((1 - A) / (1 - ps))
+weighted_mean_safe <- function(x, w) {
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) return(NA_real_)
+  sum(x * w) / sw
+}
+
+effective_sample_size <- function(w) {
+  if (length(w) == 0 || any(!is.finite(w)) || sum(w^2) <= 0) return(NA_real_)
+  (sum(w)^2) / sum(w^2)
+}
+
+ate_weights <- function(A, ps, eps = 1e-7) {
+  ps <- clip_ps(ps, eps)
+  ifelse(A == 1, 1 / ps, 1 / (1 - ps))
+}
+
+stabilized_weights <- function(A, ps, eps = 1e-7) {
+  ps <- clip_ps(ps, eps)
+  pa <- mean(A)
+  ifelse(A == 1, pa / ps, (1 - pa) / (1 - ps))
+}
+
+estimate_ipw_ate <- function(Y, A, ps, eps = 1e-7) {
+  ps <- clip_ps(ps, eps)
+  mu1 <- sum(A * Y / ps) / sum(A / ps)
+  mu0 <- sum((1 - A) * Y / (1 - ps)) / sum((1 - A) / (1 - ps))
   as.numeric(mu1 - mu0)
 }
 
-bootstrap_summary <- function(point, boots, null_value = 0, digits = 3) {
-  se <- stats::sd(boots)
-  lcl <- point - 1.96 * se
-  ucl <- point + 1.96 * se
-  p_value <- 2 * stats::pt(abs((point - null_value) / se),
-                           df = length(boots) - 1,
-                           lower.tail = FALSE)
-  data.frame(
-    Estimate = round(point, digits),
-    BSSE = round(se, digits),
-    LCL = round(lcl, digits),
-    UCL = round(ucl, digits),
-    P_value = ifelse(p_value < 0.001, "<0.001", as.character(round(p_value, digits))),
-    stringsAsFactors = FALSE
-  )
-}
-
-# Candidate ANN hidden-layer structures used in the manuscript.
-default_hidden_candidates <- function() {
-  list(
-    2, 3, 4, 5, 6, 7, 8, 9,
-    c(2, 2), c(3, 3), c(4, 4), c(5, 5), c(6, 6), c(7, 7), c(8, 8), c(9, 9),
-    c(2, 2, 2), c(3, 3, 3), c(4, 4, 4), c(5, 5, 5), c(6, 6, 6),
-    c(2, 2, 2, 2), c(3, 3, 3, 3), c(4, 4, 4, 4), c(5, 5, 5, 5), c(6, 6, 6, 6),
-    c(2, 2, 2, 2, 2), c(3, 3, 3, 3, 3), c(4, 4, 4, 4, 4),
-    c(5, 5, 5, 5, 5), c(6, 6, 6, 6, 6)
-  )
-}
-
-structure_to_string <- function(h) paste(h, collapse = "-")
-
 ################################################################################
-# Data-generating mechanism used in the simulation example
-#
-# This function follows the data-generating setting described in the manuscript:
-# - 12 baseline covariates are generated.
-# - X1-X4 are associated with both treatment and outcome.
-# - X5-X7 are associated only with treatment.
-# - X8-X10 are associated only with outcome.
-# - X11-X12 are independent noise covariates.
-# - alpha0 = -0.75 gives approximately 25% treated subjects.
-# - alpha0 = 0 gives approximately 50% treated subjects.
-# - true_ate = 1 is the true average causal effect.
+# 2. A small demonstration data-generating mechanism
 ################################################################################
 
-generate_npMiPS_data <- function(seed = 1,
-                                n = 300,
-                                alpha0 = -0.75,
-                                true_ate = 1) {
+# The DGM below is intentionally different from the manuscript.
+# It uses only six baseline covariates and modest nonlinear terms.
+
+generate_demo_data <- function(n = 600, seed = 2026, true_ate = 1.5) {
   set.seed(seed)
 
-  alpha <- c(0.18, -0.17, -0.08, 0.19, -0.16, 0.20, -0.11, rep(0, 3))
-  beta0 <- -1.2
-  beta <- c(0.58, -0.29, -0.58, 0.65, rep(0, 3), 0.67, -0.31, 0.62)
+  X1 <- rnorm(n)
+  X2 <- rnorm(n)
+  X3 <- rbinom(n, 1, 0.50)
+  X4 <- rnorm(n)
+  X5 <- rbinom(n, 1, 0.40)
+  X6 <- rnorm(n)
 
-  X1.5 <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = matrix(c(1, 0.2, 0.2, 1), 2))
-  X1 <- X1.5[, 1]
-  X5 <- X1.5[, 2]
+  X <- data.frame(X1, X2, X3, X4, X5, X6)
 
-  X2.6 <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = matrix(c(1, 0.9, 0.9, 1), 2))
-  X2 <- X2.6[, 1]
-  X6 <- X2.6[, 2]
+  # Treatment mechanism: nonlinear, but intentionally simple.
+  lp_a <- -0.35 +
+    0.55 * X1 - 0.45 * X2 + 0.60 * X3 +
+    0.25 * X1 * X2 - 0.20 * X4^2
+  ps_true <- expit(lp_a)
+  A <- rbinom(n, 1, ps_true)
 
-  X3.8 <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = matrix(c(1, 0.2, 0.2, 1), 2))
-  X3 <- X3.8[, 1]
-  X8 <- X3.8[, 2]
+  # Outcome mechanism: constant treatment effect plus nonlinear prognostic terms.
+  mu0 <- 0.40 +
+    0.75 * X1 - 0.55 * X2 + 0.45 * X4 + 0.50 * X5 +
+    0.25 * X1^2 - 0.30 * X2 * X3
+  Y <- mu0 + true_ate * A + rnorm(n, sd = 1)
 
-  X4.9 <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = matrix(c(1, 0.9, 0.9, 1), 2))
-  X4 <- X4.9[, 1]
-  X9 <- X4.9[, 2]
-
-  X7 <- stats::rnorm(n)
-  X10 <- stats::rnorm(n)
-
-  X2 <- ifelse(X2 > mean(X2), 1, 0)
-  X5 <- ifelse(X5 > mean(X5), 1, 0)
-  X8 <- ifelse(X8 > mean(X8), 1, 0)
-
-  X_for_dgm <- cbind(X1, X2, X3, X4, X5, X6, X7, X8, X9, X10)
-  ps_true <- expit(as.numeric(alpha0 + X_for_dgm %*% alpha))
-  A <- stats::rbinom(n, size = 1, prob = ps_true)
-
-  Y1 <- true_ate + beta0 + as.numeric(X_for_dgm %*% beta)
-  Y0 <- beta0 + as.numeric(X_for_dgm %*% beta)
-  Y <- A * Y1 + (1 - A) * Y0 + stats::rnorm(n)
-
-  X11 <- stats::rnorm(n)
-  X12 <- stats::rbinom(n, size = 1, prob = 0.5)
-  X <- cbind(X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12)
-  colnames(X) <- paste0("X", seq_len(ncol(X)))
-
-  list(Y = as.numeric(Y), A = as.numeric(A), X = X, true_ps = ps_true, true_ate = true_ate)
+  list(
+    Y = as.numeric(Y),
+    A = as.numeric(A),
+    X = X,
+    true_ate = true_ate,
+    true_ps = ps_true
+  )
 }
 
 ################################################################################
-# Single-model PS and OcR estimators
+# 3. Candidate ANN structures
 ################################################################################
 
-# Parametric PS covariate sets used in the manuscript simulation.
-# correct    : true PS covariates, X1-X7.
-# incorrect1 : wrong covariate selection, X1, X2, X5, X11.
-# incorrect2 : functional-form misspecification, squared X1-X7.
-get_ps_covariates <- function(X, model = c("correct", "incorrect1", "incorrect2")) {
-  model <- match.arg(model)
-  if (model == "correct") {
-    return(as.data.frame(X[, 1:7, drop = FALSE]))
-  }
-  if (model == "incorrect1") {
-    return(as.data.frame(X[, c(1, 2, 5, 11), drop = FALSE]))
-  }
-  as.data.frame((X^2)[, 1:7, drop = FALSE])
+demo_ann_candidates <- function() {
+  list(3, 5, c(4, 4))
 }
 
-# Parametric OcR covariate sets used in the manuscript simulation.
-# correct    : true OcR covariates, X1-X4 and X8-X10.
-# incorrect1 : wrong covariate selection, X1, X2, X8, X11.
-# incorrect2 : functional-form misspecification, squared true OcR covariates.
-get_or_covariates <- function(X, model = c("correct", "incorrect1", "incorrect2")) {
-  model <- match.arg(model)
-  if (model == "correct") {
-    return(as.data.frame(X[, c(1:4, 8:10), drop = FALSE]))
-  }
-  if (model == "incorrect1") {
-    return(as.data.frame(X[, c(1, 2, 8, 11), drop = FALSE]))
-  }
-  as.data.frame((X^2)[, c(1:4, 8:10), drop = FALSE])
+demo_integration_candidates <- function() {
+  list(3, 5, c(4, 4), c(5, 5))
 }
 
-fit_parametric_ps <- function(A, X, model = c("correct", "incorrect1", "incorrect2")) {
-  Z <- get_ps_covariates(X, model = model)
-  dat <- data.frame(A = A, Z)
-  fit <- stats::glm(A ~ ., data = dat, family = stats::binomial())
-  ps <- as.numeric(stats::predict(fit, type = "response"))
-  index <- as.numeric(as.matrix(Z) %*% stats::coef(fit)[-1])
-  list(fit = fit, ps = clip_probability(ps), index = index)
+# Larger candidate set used by the revised workflow.
+full_integration_candidates <- function() {
+  c(
+    lapply(2:9, function(x) x),
+    lapply(2:9, function(x) c(x, x)),
+    lapply(2:6, function(x) c(x, x, x)),
+    lapply(2:6, function(x) c(x, x, x, x)),
+    lapply(2:6, function(x) c(x, x, x, x, x))
+  )
 }
 
-fit_parametric_or <- function(Y, A, X, model = c("correct", "incorrect1", "incorrect2")) {
-  Z <- get_or_covariates(X, model = model)
-  dat <- data.frame(Y = Y, A = A, Z)
-  fit <- stats::lm(Y ~ ., data = dat)
+################################################################################
+# 4. AMORE wrappers
+################################################################################
 
-  dat1 <- dat
-  dat1$A <- 1
-  dat0 <- dat
-  dat0$A <- 0
-  mu1 <- stats::predict(fit, newdata = dat1)
-  mu0 <- stats::predict(fit, newdata = dat0)
+fit_amore <- function(x, y, hidden.neurons, output.layer, seed = 1) {
+  x <- as.matrix(x)
+  storage.mode(x) <- "double"
+  y <- as.numeric(y)
 
-  coefs <- stats::coef(fit)
-  z_names <- colnames(Z)
-  index <- as.numeric(as.matrix(Z) %*% coefs[z_names])
+  set.seed(seed)
+  net <- AMORE::newff(
+    c(ncol(x), as.integer(hidden.neurons), 1),
+    learning.rate.global = 0.001,
+    momentum.global = 0.5,
+    error.criterium = "LMS",
+    Stao = NA,
+    hidden.layer = "tansig",
+    output.layer = output.layer,
+    method = "ADAPTgdwm"
+  )
 
-  list(fit = fit, mu1 = as.numeric(mu1), mu0 = as.numeric(mu0),
-       ate = mean(mu1 - mu0), index = index)
+  fit <- AMORE::train(
+    net, x, y,
+    error.criterium = "LMS",
+    report = FALSE,
+    show.step = 100,
+    n.shows = 5
+  )
+  fit$net
 }
 
-fit_ann_ps <- function(A, X,
-                       hidden.neurons = 5,
-                       learning.rate.global = 0.001,
-                       momentum.global = 0.5,
-                       error.criterium = "LMS",
-                       hidden.layer = "tansig",
-                       output.layer = "sigmoid",
-                       method = "ADAPTgdwm") {
-  dat <- data.frame(A = A, X)
-  n.neurons <- c(ncol(dat) - 1, hidden.neurons, 1)
-  net <- AMORE::newff(n.neurons,
-                      learning.rate.global = learning.rate.global,
-                      momentum.global = momentum.global,
-                      error.criterium = error.criterium,
-                      Stao = NA,
-                      hidden.layer = hidden.layer,
-                      output.layer = output.layer,
-                      method = method)
-  fit <- AMORE::train(net, dat[, -1, drop = FALSE], as.numeric(dat[, 1]),
-                      error.criterium = error.criterium,
-                      report = FALSE,
-                      show.step = 100,
-                      n.shows = 5)
-  ps <- clip_probability(AMORE::sim(fit$net, dat[, -1, drop = FALSE]))
-  list(net = fit$net, ps = ps, index = logit_safe(ps))
+predict_amore <- function(net, x) {
+  x <- as.matrix(x)
+  storage.mode(x) <- "double"
+  as.numeric(AMORE::sim(net, x))
 }
 
-fit_ann_or <- function(Y, A, X,
-                       hidden.neurons = c(9, 9),
-                       learning.rate.global = 0.001,
-                       momentum.global = 0.5,
-                       error.criterium = "LMS",
-                       hidden.layer = "tansig",
-                       output.layer = "purelin",
-                       method = "ADAPTgdwm") {
-  dat <- data.frame(Y = Y, A = A, X)
-  n.neurons <- c(ncol(dat) - 1, hidden.neurons, 1)
-  net <- AMORE::newff(n.neurons,
-                      learning.rate.global = learning.rate.global,
-                      momentum.global = momentum.global,
-                      error.criterium = error.criterium,
-                      Stao = NA,
-                      hidden.layer = hidden.layer,
-                      output.layer = output.layer,
-                      method = method)
-  fit <- AMORE::train(net, dat[, -1, drop = FALSE], as.numeric(dat[, 1]),
-                      error.criterium = error.criterium,
-                      report = FALSE,
-                      show.step = 100,
-                      n.shows = 5)
+################################################################################
+# 5. Parametric nuisance models used in the educational example
+################################################################################
 
-  dat1 <- dat
-  dat1$A <- 1
-  dat0 <- dat
-  dat0$A <- 0
-  mu1 <- as.numeric(AMORE::sim(fit$net, dat1[, -1, drop = FALSE]))
-  mu0 <- as.numeric(AMORE::sim(fit$net, dat0[, -1, drop = FALSE]))
-  fitted_y <- as.numeric(AMORE::sim(fit$net, dat[, -1, drop = FALSE]))
+# These are deliberately simple and not identical to manuscript specifications.
 
-  list(net = fit$net, mu1 = mu1, mu0 = mu0, ate = mean(mu1 - mu0),
-       index = mu0, fitted_y = fitted_y)
+fit_parametric_ps_models <- function(A_train, X_train, X_new) {
+  d1 <- data.frame(A = A_train, X_train)
+  fit1 <- glm(A ~ X1 + X2 + X3 + X4 + X5 + X6,
+              family = binomial(), data = d1)
+
+  fit2 <- glm(A ~ X1 + X2 + X3,
+              family = binomial(), data = d1)
+
+  p1_tr <- clip_ps(predict(fit1, type = "response"))
+  p1_ne <- clip_ps(predict(fit1, newdata = X_new, type = "response"))
+  p2_tr <- clip_ps(predict(fit2, type = "response"))
+  p2_ne <- clip_ps(predict(fit2, newdata = X_new, type = "response"))
+
+  list(
+    train = data.frame(ps1 = qlogis(p1_tr), ps2 = qlogis(p2_tr)),
+    new   = data.frame(ps1 = qlogis(p1_ne), ps2 = qlogis(p2_ne))
+  )
 }
 
-estimate_mpipw <- function(Y, A, X,
-                           ps_type = c("ANN", "correct", "incorrect1", "incorrect2"),
-                           hidden.neurons = 5) {
-  ps_type <- match.arg(ps_type)
-  if (ps_type == "ANN") {
-    ps <- fit_ann_ps(A, X, hidden.neurons = hidden.neurons)$ps
+fit_parametric_or_models <- function(Y_train, A_train, X_train, X_new) {
+  d1 <- data.frame(Y = Y_train, A = A_train, X_train)
+
+  fit1 <- lm(Y ~ A + X1 + X2 + X3 + X4 + X5 + X6, data = d1)
+  fit2 <- lm(Y ~ A + X1 + X2 + X4 + X5, data = d1)
+
+  tr0 <- data.frame(A = 0, X_train)
+  ne0 <- data.frame(A = 0, X_new)
+
+  list(
+    train = data.frame(
+      or1 = as.numeric(predict(fit1, newdata = tr0)),
+      or2 = as.numeric(predict(fit2, newdata = tr0))
+    ),
+    new = data.frame(
+      or1 = as.numeric(predict(fit1, newdata = ne0)),
+      or2 = as.numeric(predict(fit2, newdata = ne0))
+    )
+  )
+}
+
+################################################################################
+# 6. ANN nuisance models
+################################################################################
+
+fit_ann_ps_index <- function(A_train, X_train, X_new, hidden, seed = 1) {
+  net <- fit_amore(X_train, A_train, hidden, output.layer = "sigmoid", seed = seed)
+  p_tr <- clip_ps(predict_amore(net, X_train))
+  p_ne <- clip_ps(predict_amore(net, X_new))
+  list(train = qlogis(p_tr), new = qlogis(p_ne), ps_train = p_tr)
+}
+
+fit_ann_or_index <- function(Y_train, A_train, X_train, X_new, hidden, seed = 1) {
+  xtr <- data.frame(A = A_train, X_train)
+  net <- fit_amore(xtr, Y_train, hidden, output.layer = "purelin", seed = seed)
+
+  tr0 <- data.frame(A = 0, X_train)
+  ne0 <- data.frame(A = 0, X_new)
+
+  fitted_obs <- predict_amore(net, xtr)
+  list(
+    train = predict_amore(net, tr0),
+    new = predict_amore(net, ne0),
+    fitted_obs = fitted_obs
+  )
+}
+
+################################################################################
+# 7. Balance and PS diagnostics
+################################################################################
+
+balance_diagnostics <- function(A, X, ps, eps = 1e-7) {
+  ps <- clip_ps(ps, eps)
+  w <- ate_weights(A, ps, eps)
+  X <- as.data.frame(X)
+
+  sds <- vapply(X, sd, numeric(1))
+  smd <- vapply(names(X), function(nm) {
+    den <- sds[[nm]]
+    if (!is.finite(den) || den <= 0) return(NA_real_)
+    m1 <- weighted_mean_safe(X[[nm]][A == 1], w[A == 1])
+    m0 <- weighted_mean_safe(X[[nm]][A == 0], w[A == 0])
+    abs(m1 - m0) / den
+  }, numeric(1))
+
+  c(MASMD = mean(smd, na.rm = TRUE), MaxASMD = max(smd, na.rm = TRUE))
+}
+
+ps_diagnostics <- function(A, X, ps, eps = 1e-7) {
+  ps <- clip_ps(ps, eps)
+  bal <- balance_diagnostics(A, X, ps, eps)
+  sw <- stabilized_weights(A, ps, eps)
+  lp <- qlogis(ps)
+
+  cal_fit <- suppressWarnings(try(glm(A ~ lp, family = binomial()), silent = TRUE))
+  if (inherits(cal_fit, "try-error")) {
+    cal_int <- NA_real_
+    cal_slope <- NA_real_
   } else {
-    ps <- fit_parametric_ps(A, X, model = ps_type)$ps
-  }
-  estimate_ipw(Y, A, ps)
-}
-
-estimate_gcomp <- function(Y, A, X,
-                           or_type = c("ANN", "correct", "incorrect1", "incorrect2"),
-                           hidden.neurons = c(9, 9)) {
-  or_type <- match.arg(or_type)
-  if (or_type == "ANN") {
-    return(fit_ann_or(Y, A, X, hidden.neurons = hidden.neurons)$ate)
-  }
-  fit_parametric_or(Y, A, X, model = or_type)$ate
-}
-
-################################################################################
-# npMiPS construction
-################################################################################
-
-# Mapping between example code and manuscript model sets.
-#
-# model_set = "with_correct" corresponds to model sets A and B in the manuscript:
-#   pi1(X) = ANN.PS, pi2(X) = correctly specified parametric PS,
-#   pi3(X) = misspecified parametric PS,
-#   mA1(X) = ANN.OcR, mA2(X) = correctly specified parametric OcR,
-#   mA3(X) = misspecified parametric OcR.
-#
-# model_set = "without_correct" corresponds to model sets P and M in the manuscript:
-#   pi1(X) = ANN.PS, pi2(X) = misspecified PS by wrong covariate selection,
-#   pi3(X) = misspecified PS by wrong functional form,
-#   mA1(X) = ANN.OcR, mA2(X) = misspecified OcR by wrong covariate selection,
-#   mA3(X) = misspecified OcR by wrong functional form.
-model_set_map <- function(model_set = c("with_correct", "without_correct")) {
-  model_set <- match.arg(model_set)
-  if (model_set == "with_correct") {
-    return(list(ps1 = "correct", ps2 = "incorrect2",
-                or1 = "correct", or2 = "incorrect2"))
-  }
-  list(ps1 = "incorrect1", ps2 = "incorrect2",
-       or1 = "incorrect1", or2 = "incorrect2")
-}
-
-validate_code <- function(code) {
-  code <- as.character(code)
-  if (!grepl("^[01]{6}$", code)) {
-    stop("The model code must be a six-digit string containing only 0 and 1, e.g., '100100' or '111111'.",
-         call. = FALSE)
-  }
-  as.integer(strsplit(code, "")[[1]])
-}
-
-build_npMiPS_indexes <- function(Y, A, X,
-                                 code = "111111",
-                                 model_set = c("with_correct", "without_correct"),
-                                 h_ps_ann = 5,
-                                 h_or_ann = c(9, 9)) {
-  digits <- validate_code(code)
-  models <- model_set_map(model_set)
-  index_list <- list(A = A)
-
-  if (digits[1] == 1) {
-    index_list$PS_ANN <- fit_ann_ps(A, X, hidden.neurons = h_ps_ann)$index
-  }
-  if (digits[2] == 1) {
-    index_list$PS_1 <- fit_parametric_ps(A, X, model = models$ps1)$index
-  }
-  if (digits[3] == 1) {
-    index_list$PS_2 <- fit_parametric_ps(A, X, model = models$ps2)$index
-  }
-  if (digits[4] == 1) {
-    index_list$OcR_ANN <- fit_ann_or(Y, A, X, hidden.neurons = h_or_ann)$index
-  }
-  if (digits[5] == 1) {
-    index_list$OcR_1 <- fit_parametric_or(Y, A, X, model = models$or1)$index
-  }
-  if (digits[6] == 1) {
-    index_list$OcR_2 <- fit_parametric_or(Y, A, X, model = models$or2)$index
+    cf <- coef(cal_fit)
+    cal_int <- unname(cf[1])
+    cal_slope <- unname(cf[2])
   }
 
-  if (length(index_list) == 1) {
-    stop("No PS or OcR model was selected. At least one digit in the model code must be 1.",
-         call. = FALSE)
-  }
-
-  as.data.frame(index_list)
-}
-
-fit_npMiPS <- function(Y, A, X,
-                       code = "111111",
-                       model_set = c("with_correct", "without_correct"),
-                       h_npMiPS = 4,
-                       h_ps_ann = 5,
-                       h_or_ann = c(9, 9),
-                       learning.rate.global = 0.001,
-                       momentum.global = 0.5,
-                       error.criterium = "LMS",
-                       hidden.layer = "tansig",
-                       output.layer = "sigmoid",
-                       method = "ADAPTgdwm") {
-  indexes <- build_npMiPS_indexes(Y, A, X,
-                                  code = code,
-                                  model_set = model_set,
-                                  h_ps_ann = h_ps_ann,
-                                  h_or_ann = h_or_ann)
-  x_train <- indexes[, -1, drop = FALSE]
-  n.neurons <- c(ncol(x_train), h_npMiPS, 1)
-  net <- AMORE::newff(n.neurons,
-                      learning.rate.global = learning.rate.global,
-                      momentum.global = momentum.global,
-                      error.criterium = error.criterium,
-                      Stao = NA,
-                      hidden.layer = hidden.layer,
-                      output.layer = output.layer,
-                      method = method)
-  fit <- AMORE::train(net, x_train, as.numeric(indexes[, 1]),
-                      error.criterium = error.criterium,
-                      report = FALSE,
-                      show.step = 100,
-                      n.shows = 5)
-  ps_npMiPS <- clip_probability(AMORE::sim(fit$net, x_train))
-  list(net = fit$net, ps = ps_npMiPS, indexes = indexes)
-}
-
-estimate_npMiPS <- function(Y, A, X,
-                            code = "111111",
-                            model_set = c("with_correct", "without_correct"),
-                            h_npMiPS = 4,
-                            h_ps_ann = 5,
-                            h_or_ann = c(9, 9)) {
-  fit <- fit_npMiPS(Y, A, X,
-                    code = code,
-                    model_set = model_set,
-                    h_npMiPS = h_npMiPS,
-                    h_ps_ann = h_ps_ann,
-                    h_or_ann = h_or_ann)
-  estimate_ipw(Y, A, fit$ps)
+  c(
+    Brier = mean((A - ps)^2),
+    MASMD = bal[["MASMD"]],
+    MaxASMD = bal[["MaxASMD"]],
+    CalIntercept = cal_int,
+    CalSlope = cal_slope,
+    ESS_total = effective_sample_size(sw),
+    ESS_treated = effective_sample_size(sw[A == 1]),
+    ESS_control = effective_sample_size(sw[A == 0]),
+    P99_stabilized_weight = unname(quantile(sw, 0.99)),
+    Max_stabilized_weight = max(sw),
+    Extreme_PS_fraction = mean(ps < 0.05 | ps > 0.95),
+    PS_P01 = unname(quantile(ps, 0.01)),
+    PS_P99 = unname(quantile(ps, 0.99))
+  )
 }
 
 ################################################################################
-# ANN structure selection on one observed dataset
+# 8. Select ANN.PS and ANN.OcR structures in the observed dataset
 ################################################################################
 
-select_ann_ps_structure <- function(A, X,
-                                    candidate_structures = default_hidden_candidates()) {
-  sd_treated <- apply(X[A == 1, , drop = FALSE], 2, stats::sd)
-  scores <- numeric(length(candidate_structures))
-
-  for (i in seq_along(candidate_structures)) {
-    h <- candidate_structures[[i]]
-    ps <- fit_ann_ps(A, X, hidden.neurons = h)$ps
-    sw <- ifelse(A == 1, mean(A) / ps, (1 - mean(A)) / (1 - ps))
-    amd <- apply(X, 2, absolute_mean_difference, A = A, w = sw)
-    asmd <- amd / sd_treated
-    scores[i] <- mean(asmd, na.rm = TRUE)
-  }
-
-  best <- which.min(scores)
-  list(best_structure = candidate_structures[[best]],
-       criterion = "MASMD",
-       scores = data.frame(structure = sapply(candidate_structures, structure_to_string),
-                           MASMD = scores,
-                           stringsAsFactors = FALSE))
+select_ann_ps_structure <- function(A, X, candidates = demo_ann_candidates(), seed = 100) {
+  ans <- lapply(seq_along(candidates), function(i) {
+    h <- candidates[[i]]
+    fit <- fit_ann_ps_index(A, X, X, h, seed_hash(seed, "ps", i))
+    bal <- balance_diagnostics(A, X, fit$ps_train)
+    data.frame(
+      candidate = i,
+      structure = structure_label(h),
+      MASMD = bal[["MASMD"]],
+      stringsAsFactors = FALSE
+    )
+  })
+  tab <- do.call(rbind, ans)
+  best <- which.min(tab$MASMD)
+  list(hidden = candidates[[best]], table = tab)
 }
 
-select_ann_or_structure <- function(Y, A, X,
-                                    candidate_structures = default_hidden_candidates()) {
-  scores <- numeric(length(candidate_structures))
-
-  for (i in seq_along(candidate_structures)) {
-    h <- candidate_structures[[i]]
-    fit <- fit_ann_or(Y, A, X, hidden.neurons = h)
-    scores[i] <- mean(abs(Y - fit$fitted_y))
-  }
-
-  best <- which.min(scores)
-  list(best_structure = candidate_structures[[best]],
-       criterion = "MOPAE",
-       scores = data.frame(structure = sapply(candidate_structures, structure_to_string),
-                           MOPAE = scores,
-                           stringsAsFactors = FALSE))
-}
-
-select_npMiPS_structure <- function(Y, A, X,
-                                    code = "111111",
-                                    model_set = c("with_correct", "without_correct"),
-                                    h_ps_ann = 5,
-                                    h_or_ann = c(9, 9),
-                                    candidate_structures = default_hidden_candidates()) {
-  scores <- numeric(length(candidate_structures))
-
-  for (i in seq_along(candidate_structures)) {
-    h <- candidate_structures[[i]]
-    ps <- fit_npMiPS(Y, A, X,
-                     code = code,
-                     model_set = model_set,
-                     h_npMiPS = h,
-                     h_ps_ann = h_ps_ann,
-                     h_or_ann = h_or_ann)$ps
-    pred_A <- ifelse(ps > 0.5, 1, 0)
-    scores[i] <- mean(pred_A == A)
-  }
-
-  best <- which.max(scores)
-  list(best_structure = candidate_structures[[best]],
-       criterion = "PAT",
-       scores = data.frame(structure = sapply(candidate_structures, structure_to_string),
-                           PAT = scores,
-                           stringsAsFactors = FALSE))
-}
-
-select_single_dataset_structures <- function(Y, A, X,
-                                             code = "111111",
-                                             model_set = c("with_correct", "without_correct"),
-                                             candidate_structures = default_hidden_candidates(),
-                                             default_ps_structure = 5,
-                                             default_or_structure = c(9, 9)) {
-  digits <- validate_code(code)
-
-  ps_sel <- NULL
-  or_sel <- NULL
-  h_ps <- default_ps_structure
-  h_or <- default_or_structure
-
-  if (digits[1] == 1) {
-    ps_sel <- select_ann_ps_structure(A, X, candidate_structures)
-    h_ps <- ps_sel$best_structure
-  }
-
-  if (digits[4] == 1) {
-    or_sel <- select_ann_or_structure(Y, A, X, candidate_structures)
-    h_or <- or_sel$best_structure
-  }
-
-  np_sel <- select_npMiPS_structure(Y, A, X,
-                                    code = code,
-                                    model_set = model_set,
-                                    h_ps_ann = h_ps,
-                                    h_or_ann = h_or,
-                                    candidate_structures = candidate_structures)
-
-  list(h_ps_ann = h_ps,
-       h_or_ann = h_or,
-       h_npMiPS = np_sel$best_structure,
-       ps_selection = ps_sel,
-       or_selection = or_sel,
-       npMiPS_selection = np_sel)
+select_ann_or_structure <- function(Y, A, X, candidates = demo_ann_candidates(), seed = 200) {
+  ans <- lapply(seq_along(candidates), function(i) {
+    h <- candidates[[i]]
+    fit <- fit_ann_or_index(Y, A, X, X, h, seed_hash(seed, "or", i))
+    mopae <- mean(abs(Y - fit$fitted_obs))
+    data.frame(
+      candidate = i,
+      structure = structure_label(h),
+      MOPAE = mopae,
+      stringsAsFactors = FALSE
+    )
+  })
+  tab <- do.call(rbind, ans)
+  best <- which.min(tab$MOPAE)
+  list(hidden = candidates[[best]], table = tab)
 }
 
 ################################################################################
-# Point estimate and bootstrap using fixed ANN structures
+# 9. Build the six npMiPS model indexes
 ################################################################################
 
-estimate_npMiPS_with_bootstrap <- function(Y, A, X,
-                                           code = "111111",
-                                           model_set = c("with_correct", "without_correct"),
-                                           h_npMiPS = 4,
-                                           h_ps_ann = 5,
-                                           h_or_ann = c(9, 9),
-                                           boot_num = 100,
-                                           seed = 2026,
-                                           save_each_bootstrap = FALSE,
-                                           output_dir = NULL,
-                                           file_prefix = "npMiPS") {
-  point <- estimate_npMiPS(Y, A, X,
-                           code = code,
-                           model_set = model_set,
-                           h_npMiPS = h_npMiPS,
-                           h_ps_ann = h_ps_ann,
-                           h_or_ann = h_or_ann)
+build_all_indexes <- function(Y_train, A_train, X_train, X_new,
+                              h_ps_ann, h_or_ann, seed = 1) {
+  pmod <- fit_parametric_ps_models(A_train, X_train, X_new)
+  omod <- fit_parametric_or_models(Y_train, A_train, X_train, X_new)
+  pann <- fit_ann_ps_index(A_train, X_train, X_new, h_ps_ann,
+                           seed_hash(seed, "ANNPS"))
+  oann <- fit_ann_or_index(Y_train, A_train, X_train, X_new, h_or_ann,
+                           seed_hash(seed, "ANNOR"))
 
-  boots <- rep(NA_real_, boot_num)
-  dat <- data.frame(Y = Y, A = A, X)
+  train <- data.frame(
+    ANN_PS = pann$train,
+    PS_1 = pmod$train$ps1,
+    PS_2 = pmod$train$ps2,
+    ANN_OcR = oann$train,
+    OcR_1 = omod$train$or1,
+    OcR_2 = omod$train$or2
+  )
 
-  if (save_each_bootstrap) {
-    if (is.null(output_dir)) output_dir <- getwd()
-    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  new <- data.frame(
+    ANN_PS = pann$new,
+    PS_1 = pmod$new$ps1,
+    PS_2 = pmod$new$ps2,
+    ANN_OcR = oann$new,
+    OcR_1 = omod$new$or1,
+    OcR_2 = omod$new$or2
+  )
+
+  list(train = train, new = new)
+}
+
+subset_indexes <- function(index_df, code = "111111") {
+  if (!grepl("^[01]{6}$", code)) stop("code must be a six-digit 0/1 string")
+  keep <- as.integer(strsplit(code, "", fixed = TRUE)[[1]]) == 1
+  if (!any(keep)) stop("At least one index must be included.")
+  index_df[, keep, drop = FALSE]
+}
+
+################################################################################
+# 10. Integration ANN and OOF-MASMD selection
+################################################################################
+
+fit_integration_ann <- function(index_train, A_train, hidden, seed = 1) {
+  fit_amore(index_train, A_train, hidden, output.layer = "sigmoid", seed = seed)
+}
+
+predict_integration_ann <- function(net, index_new, eps = 1e-7) {
+  clip_ps(predict_amore(net, index_new), eps)
+}
+
+select_integration_oof_masmd <- function(Y, A, X,
+                                         code = "111111",
+                                         h_ps_ann,
+                                         h_or_ann,
+                                         candidate_structures = demo_integration_candidates(),
+                                         K = 3,
+                                         seed = 300,
+                                         eps = 1e-7,
+                                         tie_tol = 1e-12) {
+  folds <- make_stratified_folds(A, K = K, seed = seed)
+
+  # Cache nuisance indexes once per outer fold.
+  fold_cache <- vector("list", K)
+  for (k in seq_len(K)) {
+    tr <- which(folds != k)
+    te <- which(folds == k)
+    idx <- build_all_indexes(
+      Y_train = Y[tr], A_train = A[tr], X_train = X[tr, , drop = FALSE],
+      X_new = X[te, , drop = FALSE],
+      h_ps_ann = h_ps_ann, h_or_ann = h_or_ann,
+      seed = seed_hash(seed, "nuisance", k)
+    )
+    fold_cache[[k]] <- list(tr = tr, te = te, index_train = idx$train, index_test = idx$new)
   }
 
-  for (b in seq_len(boot_num)) {
-    set.seed(seed + b)
-    id <- sample(seq_len(nrow(dat)), size = nrow(dat), replace = TRUE)
-    boot_dat <- dat[id, , drop = FALSE]
-    Yb <- boot_dat$Y
-    Ab <- boot_dat$A
-    Xb <- as.matrix(boot_dat[, -(1:2), drop = FALSE])
+  rows <- vector("list", length(candidate_structures))
+  oof_store <- vector("list", length(candidate_structures))
 
-    boots[b] <- estimate_npMiPS(Yb, Ab, Xb,
-                                code = code,
-                                model_set = model_set,
-                                h_npMiPS = h_npMiPS,
-                                h_ps_ann = h_ps_ann,
-                                h_or_ann = h_or_ann)
+  for (j in seq_along(candidate_structures)) {
+    h <- candidate_structures[[j]]
+    oof_ps <- rep(NA_real_, length(A))
 
-    if (save_each_bootstrap) {
-      save(point, boots,
-           file = file.path(output_dir,
-                            sprintf("%s_%s_bootstrap_progress.RData", file_prefix, code)))
+    for (k in seq_len(K)) {
+      fc <- fold_cache[[k]]
+      ztr <- subset_indexes(fc$index_train, code)
+      zte <- subset_indexes(fc$index_test, code)
+      net <- fit_integration_ann(
+        ztr, A[fc$tr], h,
+        seed = seed_hash(seed, "integration", j, k)
+      )
+      oof_ps[fc$te] <- predict_integration_ann(net, zte, eps)
     }
+
+    if (anyNA(oof_ps)) stop("OOF propensity predictions are incomplete.")
+    diag <- ps_diagnostics(A, X, oof_ps, eps)
+
+    rows[[j]] <- data.frame(
+      candidate = j,
+      structure = structure_label(h),
+      MASMD = diag[["MASMD"]],
+      MaxASMD = diag[["MaxASMD"]],
+      Brier = diag[["Brier"]],
+      ESS_total = diag[["ESS_total"]],
+      Max_stabilized_weight = diag[["Max_stabilized_weight"]],
+      stringsAsFactors = FALSE
+    )
+    oof_store[[j]] <- oof_ps
   }
 
-  list(point = point,
-       boots = boots,
-       summary = bootstrap_summary(point, boots),
-       code = code,
-       model_set = match.arg(model_set),
-       h_npMiPS = h_npMiPS,
-       h_ps_ann = h_ps_ann,
-       h_or_ann = h_or_ann)
+  tab <- do.call(rbind, rows)
+  min_m <- min(tab$MASMD)
+  tied <- which(abs(tab$MASMD - min_m) <= tie_tol)
+
+  if (length(tied) > 1) {
+    max_ess <- max(tab$ESS_total[tied])
+    tied <- tied[abs(tab$ESS_total[tied] - max_ess) <= tie_tol]
+  }
+
+  if (length(tied) > 1) {
+    comp <- t(vapply(candidate_structures[tied], structure_complexity, numeric(2)))
+    ord <- order(comp[, 1], comp[, 2])
+    best <- tied[ord[1]]
+  } else {
+    best <- tied[1]
+  }
+
+  list(
+    hidden = candidate_structures[[best]],
+    selected_row = tab[best, , drop = FALSE],
+    candidate_table = tab,
+    oof_ps = oof_store[[best]],
+    folds = folds,
+    oof_diagnostics = ps_diagnostics(A, X, oof_store[[best]], eps)
+  )
+}
+
+################################################################################
+# 11. Final full-data npMiPS fit
+################################################################################
+
+fit_npMiPS_full <- function(Y, A, X, code,
+                            h_ps_ann, h_or_ann, h_integration,
+                            seed = 400, eps = 1e-7) {
+  idx <- build_all_indexes(
+    Y_train = Y, A_train = A, X_train = X,
+    X_new = X,
+    h_ps_ann = h_ps_ann, h_or_ann = h_or_ann,
+    seed = seed_hash(seed, "full_nuisance")
+  )
+
+  z <- subset_indexes(idx$train, code)
+  net <- fit_integration_ann(z, A, h_integration,
+                             seed = seed_hash(seed, "full_integration"))
+  ps <- predict_integration_ann(net, z, eps)
+
+  list(
+    ate = estimate_ipw_ate(Y, A, ps, eps),
+    ps = ps,
+    diagnostics = ps_diagnostics(A, X, ps, eps)
+  )
+}
+
+################################################################################
+# 12. Bootstrap with structures fixed after selection
+################################################################################
+
+bootstrap_npMiPS <- function(Y, A, X, code,
+                             h_ps_ann, h_or_ann, h_integration,
+                             B = 20, seed = 500, eps = 1e-7) {
+  n <- length(Y)
+  boots <- numeric(B)
+
+  for (b in seq_len(B)) {
+    set.seed(seed_hash(seed, "bootstrap", b))
+    id <- sample.int(n, size = n, replace = TRUE)
+
+    fit_b <- fit_npMiPS_full(
+      Y = Y[id], A = A[id], X = X[id, , drop = FALSE],
+      code = code,
+      h_ps_ann = h_ps_ann,
+      h_or_ann = h_or_ann,
+      h_integration = h_integration,
+      seed = seed_hash(seed, "fit", b),
+      eps = eps
+    )
+    boots[b] <- fit_b$ate
+  }
+
+  boots
+}
+
+bootstrap_summary <- function(point, boots) {
+  se <- sd(boots)
+  z <- point / se
+  data.frame(
+    Estimate = point,
+    BSSE = se,
+    LCL = point - 1.96 * se,
+    UCL = point + 1.96 * se,
+    P_value = 2 * pnorm(abs(z), lower.tail = FALSE)
+  )
 }
