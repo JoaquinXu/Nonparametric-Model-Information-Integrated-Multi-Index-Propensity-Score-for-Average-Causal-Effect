@@ -72,8 +72,6 @@ This script uses:
 
 The candidate learner library is deliberately small in this educational example.
 
-### `AMORE_0.2-15.tar.gz`
-A local source archive retained from the previous code package for convenience when AMORE is not available through the user's usual package repository.
 
 ## Required R packages
 
