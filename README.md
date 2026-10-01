@@ -77,15 +77,21 @@ A local source archive retained from the previous code package for convenience w
 
 ## Required R packages
 
-For the npMiPS demo:
+### AMORE package
+
+The npMiPS demonstration uses the `AMORE` package for fitting artificial neural networks.  
+Because `AMORE` is currently available through the CRAN Archive rather than the main CRAN repository, users who do not already have it installed can obtain the archived source package from:
+
+https://cran.r-project.org/src/contrib/Archive/AMORE/
+
+For example:
 
 ```r
-install.packages("MASS")
-# If AMORE is available from your configured repository:
-install.packages("AMORE")
-# Otherwise, from this repository folder:
-install.packages("AMORE_0.2-15.tar.gz", repos = NULL, type = "source")
-```
+install.packages(
+  "https://cran.r-project.org/src/contrib/Archive/AMORE/AMORE_0.2-15.tar.gz",
+  repos = NULL,
+  type = "source"
+)
 
 For the Super Learner AIPW demo:
 
